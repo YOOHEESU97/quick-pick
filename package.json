@@ -1,0 +1,58 @@
+{
+  "name": "quick-pick",
+  "version": "1.0.0",
+  "description": "동행복권 로또 AI 번호 추천 + 주간 자동 수동구매",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "login-test": "node dist/index.js login-test",
+    "buy": "node dist/index.js buy",
+    "recommend": "node dist/index.js recommend",
+    "check": "node dist/index.js check",
+    "sync": "node dist/index.js sync",
+    "settle": "node dist/index.js settle",
+    "fix-tickets": "tsx scripts/fix-purchase-tickets.ts",
+    "pension-buy": "node dist/index.js pension-buy",
+    "pension-recommend": "node dist/index.js pension-recommend",
+    "pension-verify": "node dist/index.js pension-verify",
+    "pension-sync": "node dist/index.js pension-sync",
+    "pension-settle": "node dist/index.js pension-settle",
+    "circuit-status": "node dist/index.js circuit-status",
+    "circuit-reset": "node dist/index.js circuit-reset",
+    "test:pension": "npm run build && node --test dist/pension/verify.test.js",
+    "web": "node dist/index.js web",
+    "schedule": "node dist/index.js schedule",
+    "dev": "tsx src/index.ts"
+  },
+  "keywords": [
+    "lotto",
+    "dhlottery",
+    "quick-pick"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.106.2",
+    "axios": "^1.9.0",
+    "axios-cookiejar-support": "^7.0.0",
+    "commander": "^13.1.0",
+    "crypto-js": "^4.2.0",
+    "dotenv": "^16.5.0",
+    "node-cron": "^3.0.3",
+    "node-forge": "^1.3.1",
+    "openai": "^4.103.0",
+    "tough-cookie": "^6.0.1"
+  },
+  "devDependencies": {
+    "@types/crypto-js": "^4.2.2",
+    "@types/node": "^22.15.21",
+    "@types/node-cron": "^3.0.11",
+    "@types/node-forge": "^1.3.11",
+    "tsx": "^4.19.4",
+    "typescript": "^5.8.3"
+  }
+}
