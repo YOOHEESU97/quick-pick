@@ -57,6 +57,13 @@ export interface PensionVerifyOutcome {
   message: string;
 }
 
+/** 세션 만료 재시도 시 번호 재검증·중복 주문번호 방지 */
+interface BuyResumeState {
+  saleRound: number;
+  finalTickets: PensionTicket[];
+  order?: { orderNo: string; orderDate: string };
+}
+
 export class Pension720Client {
   private session: AxiosInstance;
   private verbose: boolean;
@@ -133,15 +140,34 @@ export class Pension720Client {
       validatePensionTicket(ticket.group, ticket.digits);
     }
 
-    try {
-      return await this.executeBuy(tickets, round);
-    } catch (err) {
-      if (!isSessionExpiredError(err)) throw err;
-      if (this.verbose) console.log('  ↻ el 세션 만료 — www 재로그인 후 1회 재시도...');
-      if (this.reauth) await this.reauth();
-      await this.bootstrap();
-      return await this.executeBuy(tickets, round);
+    let resume: BuyResumeState | undefined;
+
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        if (attempt > 0) {
+          if (this.verbose) {
+            const digits = resume?.finalTickets[0]
+              ? normalizePensionDigits(resume.finalTickets[0].digits)
+              : '';
+            console.log(
+              `  ↻ el 세션 만료 — www 재로그인 후 구매 재개${digits ? ` (${digits})` : ''}...`
+            );
+          }
+          if (this.reauth) await this.reauth();
+          await this.bootstrap();
+          markPensionElApiNow();
+        }
+        return await this.executeBuy(tickets, round, resume);
+      } catch (err) {
+        if (attempt === 0 && isSessionExpiredError(err)) {
+          resume = err.resume;
+          continue;
+        }
+        throw err;
+      }
     }
+
+    throw new Error('연금 구매 재시도에 실패했습니다.');
   }
 
   /** 구매 없이 checkVerifyNo 만 실행 (pension-verify) */
@@ -175,61 +201,106 @@ export class Pension720Client {
     };
   }
 
-  private async executeBuy(tickets: PensionTicket[], round?: number): Promise<PensionPurchaseResult> {
-    const saleRound = await this.fetchSaleRound();
-    if (round != null && round !== saleRound && this.verbose) {
-      console.warn(`  ⚠ 회차 보정: ${round} → ${saleRound} (el API 판매 회차)`);
-    }
+  private async executeBuy(
+    tickets: PensionTicket[],
+    round?: number,
+    resume?: BuyResumeState
+  ): Promise<PensionPurchaseResult> {
     const preferredDigits = isAllGroupsBundle(tickets)
       ? normalizePensionDigits(tickets[0].digits)
       : undefined;
 
+    let saleRound: number;
     let finalTickets: PensionTicket[];
-    if (isAllGroupsBundle(tickets)) {
-      finalTickets = await this.resolveAvailableSaBundle(saleRound, preferredDigits!);
+
+    if (resume) {
+      saleRound = resume.saleRound;
+      finalTickets = resume.finalTickets;
+      if (round != null && round !== saleRound && this.verbose) {
+        console.warn(`  ⚠ 회차 보정: ${round} → ${saleRound} (재시도)`);
+      }
     } else {
-      finalTickets = [];
-      for (const ticket of tickets) {
-        const result = await this.checkVerifyNo(saleRound, ticket);
-        if (!result.available) {
-          throw new Error(
-            `${ticket.group}조 ${ticket.digits} — 이미 판매된 번호입니다. 다른 번호를 선택해주세요.`
-          );
+      saleRound = await this.fetchSaleRound();
+      if (round != null && round !== saleRound && this.verbose) {
+        console.warn(`  ⚠ 회차 보정: ${round} → ${saleRound} (el API 판매 회차)`);
+      }
+
+      if (isAllGroupsBundle(tickets)) {
+        finalTickets = await this.resolveAvailableSaBundle(saleRound, preferredDigits!);
+      } else {
+        finalTickets = [];
+        for (const ticket of tickets) {
+          const result = await this.checkVerifyNo(saleRound, ticket);
+          if (!result.available) {
+            throw new Error(
+              `${ticket.group}조 ${ticket.digits} — 이미 판매된 번호입니다. 다른 번호를 선택해주세요.`
+            );
+          }
+          finalTickets.push(...result.tickets);
         }
-        finalTickets.push(...result.tickets);
+      }
+
+      if (preferredDigits && finalTickets[0]) {
+        const bought = normalizePensionDigits(finalTickets[0].digits);
+        if (bought !== preferredDigits) {
+          console.log(`ℹ️  ${preferredDigits} 매진 → ${bought} 로 변경하여 구매`);
+        }
       }
     }
 
-    if (preferredDigits && finalTickets[0]) {
-      const bought = normalizePensionDigits(finalTickets[0].digits);
-      if (bought !== preferredDigits) {
-        console.log(`ℹ️  ${preferredDigits} 매진 → ${bought} 로 변경하여 구매`);
+    // 검증 직후 주문·결제를 연속 호출 (세션 만료·주문 잠금 방지)
+    markPensionElApiNow();
+    return await this.finalizePurchase(saleRound, finalTickets, resume?.order);
+  }
+
+  /** makeOrderNo → connPro — 검증 완료 후 즉시 실행 */
+  private async finalizePurchase(
+    saleRound: number,
+    finalTickets: PensionTicket[],
+    existingOrder?: { orderNo: string; orderDate: string }
+  ): Promise<PensionPurchaseResult> {
+    let order = existingOrder;
+
+    try {
+      if (!order) {
+        if (this.availableDeposit <= 0) {
+          await this.verifyElDeposit();
+        }
+        order = await this.makeOrderNo(saleRound, true);
+      } else if (this.verbose) {
+        console.log(`  ↻ 기존 주문번호 ${order.orderNo} 로 결제 재시도`);
       }
+
+      const buyForm = buildPensionConnProForm(
+        saleRound,
+        finalTickets,
+        this.availableDeposit,
+        order
+      );
+      const result = await this.connPro(buyForm, { immediate: true });
+      const purchased = result.saleTicket
+        ? parseSaleTickets(result.saleTicket, buyForm.get('BUY_SET_TYPE') ?? undefined)
+        : finalTickets;
+
+      return {
+        round: saleRound,
+        tickets: purchased.length ? purchased : finalTickets,
+        message: result.resultMsg ?? '구매 완료',
+        orderNo: result.orderNo ?? order.orderNo,
+      };
+    } catch (err) {
+      if (isSessionExpiredError(err)) {
+        throw new SessionExpiredError(err.detail, {
+          saleRound,
+          finalTickets,
+          order,
+        });
+      }
+      throw err;
     }
-
-    await this.refreshDeposit();
-
-    const order = await this.makeOrderNo(saleRound);
-    const buyForm = buildPensionConnProForm(saleRound, finalTickets, this.availableDeposit, order);
-
-    const result = await this.connPro(buyForm, { immediate: true });
-    const purchased = result.saleTicket
-      ? parseSaleTickets(result.saleTicket, buyForm.get('BUY_SET_TYPE') ?? undefined)
-      : finalTickets;
-
-    return {
-      round: saleRound,
-      tickets: purchased.length ? purchased : finalTickets,
-      message: result.resultMsg ?? '구매 완료',
-      orderNo: result.orderNo,
-    };
   }
 
   private async verifyElDeposit(): Promise<void> {
-    this.availableDeposit = await this.fetchDeposit();
-  }
-
-  private async refreshDeposit(): Promise<void> {
     this.availableDeposit = await this.fetchDeposit();
   }
 
@@ -301,7 +372,10 @@ export class Pension720Client {
     return result;
   }
 
-  private async makeOrderNo(round: number): Promise<{ orderNo: string; orderDate: string }> {
+  private async makeOrderNo(
+    round: number,
+    immediate = false
+  ): Promise<{ orderNo: string; orderDate: string }> {
     const frmauto = new URLSearchParams({
       ROUND: String(round),
       SEL_NO: '',
@@ -312,7 +386,12 @@ export class Pension720Client {
       ACCS_TYPE: '02',
     });
 
-    const data = await this.postEncrypted(`${EL_BASE}/makeOrderNo.do`, frmauto.toString(), MOBILE_GAME_URL);
+    const data = await this.postEncrypted(
+      `${EL_BASE}/makeOrderNo.do`,
+      frmauto.toString(),
+      MOBILE_GAME_URL,
+      immediate
+    );
     if (data.resultCode !== '100' || !data.orderNo) {
       throw new Error(`주문번호 생성 실패: ${data.resultMsg ?? data.resultCode}`);
     }
@@ -468,12 +547,19 @@ class PendingPurchaseError extends Error {
 }
 
 class SessionExpiredError extends Error {
-  constructor(detail: string) {
+  readonly detail: string;
+  readonly resume?: BuyResumeState;
+
+  constructor(detail: string, resume?: BuyResumeState) {
+    const base = `el 세션 오류: ${detail}`;
     super(
-      `el 세션 오류: ${detail}\n` +
-        'www 로그인 → el 게임 페이지 연결이 끊겼습니다. pension-buy 가 자동 재로그인을 시도합니다.'
+      resume
+        ? base
+        : `${base}\nwww 로그인 → el 게임 페이지 연결이 끊겼습니다. pension-buy 가 자동 재로그인을 시도합니다.`
     );
     this.name = 'SessionExpiredError';
+    this.detail = detail;
+    this.resume = resume;
   }
 }
 
